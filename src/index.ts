@@ -1,366 +1,80 @@
 import {
   EmitContext,
   emitFile,
-  listServices,
-  getNamespaceFullName,
-  navigateTypesInNamespace,
   Model,
-  Operation,
-  Namespace,
   Interface,
+  Namespace,
   Program,
-  Type,
-  Scalar,
-  IntrinsicType,
 } from "@typespec/compiler";
+import {
+  collectServices,
+  RpcInfo,
+  ServiceInfo,
+  toSnakeCase,
+  isStreamOp,
+} from "@speconn/typespec-emitter-core";
 
 export type EmitterOptions = {
   "emitter-output-dir": string;
 };
 
-interface FieldInfo {
-  name: string;
-  type: Type;
-  optional: boolean;
-}
-
-interface RpcInfo {
-  name: string;
-  originalName: string;
-  path: string;
-  inputType: Model | null;
-  outputType: Model | null;
-  isStream: boolean;
-}
-
-interface ServiceInfo {
-  namespace: Namespace;
-  iface: Interface;
-  serviceName: string;
-  serviceFQN: string;
-  rpcs: RpcInfo[];
-  models: Model[];
-}
-
-interface FileNames {
-  types: string;
-  server: string;
-  client: string;
-}
-
-// ==================== Helpers ====================
-
-function isStreamOp(_program: Program, op: Operation): boolean {
-  const returnModel = op.returnType;
-  if (returnModel && returnModel.kind === "Model" && returnModel.name && returnModel.name.includes("Stream")) return true;
-  return false;
-}
-
-function resolveInputModel(op: Operation): Model | null {
-  if (op.parameters && op.parameters.kind === "Model") {
-    const params = op.parameters;
-    if (params.name && params.name !== "") return params;
-    if (params.sourceModels && params.sourceModels.length > 0) {
-      for (const sm of params.sourceModels) {
-        const src = sm.model;
-        if (src.kind === "Model" && src.name && src.name !== "") return src;
-      }
-    }
-    if (params.sourceModel && params.sourceModel.name && params.sourceModel.name !== "") {
-      return params.sourceModel;
-    }
-  }
-  return null;
-}
-
-function resolveOutputModel(op: Operation): Model | null {
-  if (op.returnType && op.returnType.kind === "Model") return op.returnType;
-  return null;
-}
-
-function computeProcedurePath(ns: Namespace, iface: Interface, op: Operation): string {
-  const nsFQN = getNamespaceFullName(ns);
-  return `/${nsFQN}.${iface.name}/${op.name}`;
-}
-
-function collectServices(program: Program): ServiceInfo[] {
-  const services = listServices(program);
-  const result: ServiceInfo[] = [];
-
-  function collectFromNs(ns: Namespace) {
-    for (const [, iface] of ns.interfaces) {
-      const nsFQN = getNamespaceFullName(ns);
-      const serviceName = iface.name;
-      const rpcs: RpcInfo[] = [];
-      const models: Model[] = [];
-      const seen = new Set<string>();
-
-      for (const [opName, op] of iface.operations) {
-        const path = computeProcedurePath(ns, iface, op);
-        const inputModel = resolveInputModel(op);
-        const outputModel = resolveOutputModel(op);
-
-        if (inputModel && inputModel.name && !seen.has(inputModel.name)) {
-          models.push(inputModel);
-          seen.add(inputModel.name);
-        }
-        if (outputModel && outputModel.name && !seen.has(outputModel.name)) {
-          models.push(outputModel);
-          seen.add(outputModel.name);
-        }
-
-        rpcs.push({ name: opName.charAt(0).toLowerCase() + opName.slice(1), originalName: opName, path, inputType: inputModel, outputType: outputModel, isStream: isStreamOp(program, op) });
-      }
-
-      navigateTypesInNamespace(ns, {
-        model: (m: Model) => {
-          if (m.name && !seen.has(m.name)) { models.push(m); seen.add(m.name); }
-        },
-      });
-
-      result.push({ namespace: ns, iface, serviceName, serviceFQN: `${nsFQN}.${serviceName}`, rpcs, models });
-    }
-  }
-
-  for (const svc of services) collectFromNs(svc.type);
-
-  if (result.length === 0) {
-    const globalNs = program.getGlobalNamespaceType();
-    for (const [, ns] of globalNs.namespaces) collectFromNs(ns);
-    collectFromNs(globalNs);
-  }
-
-  return result;
-}
-
-function extractFields(model: Model): FieldInfo[] {
-  const fields: FieldInfo[] = [];
-  for (const [name, prop] of model.properties) {
-    fields.push({ name, type: prop.type, optional: prop.optional ?? false });
-  }
-  return fields;
-}
-
-// ==================== File Naming ====================
-
-function snakeBase(s: string): string {
-  return s.replace(/([A-Z])/g, (m, c, i) => (i ? "_" : "") + c.toLowerCase());
-}
-
-function camelBase(s: string): string {
-  return s.charAt(0).toLowerCase() + s.slice(1);
-}
-
-function fileNamesFor(serviceName: string, lang: string): FileNames {
-  const lower = camelBase(serviceName);
-  const snake = snakeBase(serviceName);
-  switch (lang) {
-    case "go":
-      return { types: `${snake}_types.go`, server: `${snake}_server.go`, client: `${snake}_client.go` };
-    case "node":
-      return { types: `${lower}.types.ts`, server: `${lower}.server.ts`, client: `${lower}.client.ts` };
-    case "web":
-      return { types: `${lower}.types.ts`, server: "", client: `${lower}.client.ts` };
-    case "python":
-      return { types: `${snake}_types.py`, server: `${snake}_server.py`, client: `${snake}_client.py` };
-    case "rust":
-      return { types: `${snake}_types.rs`, server: `${snake}_server.rs`, client: `${snake}_client.rs` };
-    case "kotlin":
-      return { types: `${serviceName}Types.kt`, server: "", client: `${serviceName}Client.kt` };
-    case "swift":
-      return { types: `${serviceName}Types.swift`, server: "", client: `${serviceName}Client.swift` };
-    case "dart":
-      return { types: `${snake}.types.dart`, server: "", client: `${snake}.client.dart` };
-    default:
-      return { types: `${snake}_types`, server: `${snake}_server`, client: `${snake}_client` };
-  }
-}
-
-// ==================== Type Mappers ====================
-
-function isStringType(type: Type): boolean {
-  if (type.kind === "Scalar") return (type as Scalar).name === "string";
-  if (type.kind === "Intrinsic") return (type as any).name === "string";
-  return false;
-}
-
-function isIntType(type: Type): boolean {
-  if (type.kind === "Scalar") {
-    const n = (type as Scalar).name;
-    return n === "int8" || n === "int16" || n === "int32" || n === "int64" || n === "uint8" || n === "uint16" || n === "uint32" || n === "uint64" || n === "integer";
-  }
-  return false;
-}
-
-function isFloatType(type: Type): boolean {
-  if (type.kind === "Scalar") {
-    const n = (type as Scalar).name;
-    return n === "float" || n === "float32" || n === "float64" || n === "decimal";
-  }
-  return false;
-}
-
-function isBoolType(type: Type): boolean {
-  if (type.kind === "Scalar") return (type as Scalar).name === "boolean";
-  if (type.kind === "Intrinsic") return (type as any).name === "boolean";
-  return false;
-}
-
-function isArrayType(type: Type): boolean {
-  return type.kind === "Model" && !!(type as Model).indexer;
-}
-
-function arrayElementType(type: Type): Type {
-  if (type.kind === "Model" && (type as Model).indexer) return (type as Model).indexer!.value;
-  return type;
-}
-
-function typeToGo(type: Type): string {
-  if (isStringType(type)) return "string";
-  if (isIntType(type)) return "int64";
-  if (isFloatType(type)) return "float64";
-  if (isBoolType(type)) return "bool";
-  if (isArrayType(type)) return `[]${typeToGo(arrayElementType(type))}`;
-  if (type.kind === "Model") return type.name || "any";
-  return "any";
-}
-
-function typeToTs(type: Type): string {
-  if (isStringType(type)) return "string";
-  if (isIntType(type) || isFloatType(type)) return "number";
-  if (isBoolType(type)) return "boolean";
-  if (isArrayType(type)) return `${typeToTs(arrayElementType(type))}[]`;
-  if (type.kind === "Model") return type.name || "unknown";
-  return "unknown";
-}
-
-function typeToPython(type: Type): string {
-  if (isStringType(type)) return "str";
-  if (isIntType(type)) return "int";
-  if (isFloatType(type)) return "float";
-  if (isBoolType(type)) return "bool";
-  if (isArrayType(type)) return `list[${typeToPython(arrayElementType(type))}]`;
-  if (type.kind === "Model") return type.name || "Any";
-  return "Any";
-}
-
-function typeToRust(type: Type): string {
-  if (isStringType(type)) return "String";
-  if (isIntType(type)) return "i64";
-  if (isFloatType(type)) return "f64";
-  if (isBoolType(type)) return "bool";
-  if (isArrayType(type)) return `Vec<${typeToRust(arrayElementType(type))}>`;
-  if (type.kind === "Model") return type.name || "serde_json::Value";
-  return "serde_json::Value";
-}
-
-function typeToKotlin(type: Type): string {
-  if (isStringType(type)) return "String";
-  if (isIntType(type)) return "Long";
-  if (isFloatType(type)) return "Double";
-  if (isBoolType(type)) return "Boolean";
-  if (isArrayType(type)) return `List<${typeToKotlin(arrayElementType(type))}>`;
-  if (type.kind === "Model") return type.name || "Any";
-  return "Any";
-}
-
-function typeToSwift(type: Type): string {
-  if (isStringType(type)) return "String";
-  if (isIntType(type)) return "Int64";
-  if (isFloatType(type)) return "Double";
-  if (isBoolType(type)) return "Bool";
-  if (isArrayType(type)) return `[${typeToSwift(arrayElementType(type))}]`;
-  if (type.kind === "Model") return type.name || "Any";
-  return "Any";
-}
-
-function typeToDart(type: Type): string {
-  if (isStringType(type)) return "String";
-  if (isIntType(type)) return "int";
-  if (isFloatType(type)) return "double";
-  if (isBoolType(type)) return "bool";
-  if (isArrayType(type)) return `List<${typeToDart(arrayElementType(type))}>`;
-  if (type.kind === "Model") return type.name || "dynamic";
-  return "dynamic";
-}
-
-// ==================== Kotlin Emitter ====================
-
-function emitKotlin(program: Program, services: ServiceInfo[], outputDir: string): Promise<void[]> {
+async function emitKotlin(program: Program, services: ServiceInfo[], outputDir: string): Promise<void> {
   const promises: Promise<void>[] = [];
 
   for (const svc of services) {
     if (svc.rpcs.length === 0) continue;
-    const fn = fileNamesFor(svc.serviceName, "kotlin");
-    const pkg = svc.serviceFQN.split(".").map(s => s.toLowerCase()).join(".");
-    const typesBase = fn.types.replace(/\.kt$/, "");
+    const pkg = (svc.namespace.name || "alltypes").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const reqType = (rpc: RpcInfo) => rpc.inputType?.name ?? "Unit";
+    const resType = (rpc: RpcInfo) => rpc.outputType?.name ?? "Unit";
+    const reqCodec = (rpc: RpcInfo) => rpc.inputType ? `${rpc.inputType.name}Codec` : "emptyCodec";
+    const resCodec = (rpc: RpcInfo) => rpc.outputType ? `${rpc.outputType.name}Codec` : "emptyCodec";
+    const allTypeNames = [...new Set(svc.rpcs.flatMap(rpc =>
+      [rpc.inputType?.name, rpc.outputType?.name].filter(Boolean) as string[]
+    ))];
+    const allCodecNames = [...new Set(svc.rpcs.flatMap(rpc =>
+      [
+        rpc.inputType ? `${rpc.inputType.name}Codec` : null,
+        rpc.outputType ? `${rpc.outputType.name}Codec` : null,
+      ].filter(Boolean) as string[]
+    ))];
 
-    const types: string[] = [];
-    types.push("// Generated by @speconn/typespec-speconn. DO NOT EDIT.\n");
-    types.push(`package ${pkg}\n`);
-    types.push("import kotlinx.serialization.Serializable\n");
-    for (const m of svc.models) {
-      if (!m.name) continue;
-      const fields = extractFields(m);
-      types.push("@Serializable");
-      const fieldLines = fields.map(f => `    val ${f.name}: ${typeToKotlin(f.type)}${f.optional ? "? = null" : ""}`);
-      if (fieldLines.length > 0) {
-        types.push(`data class ${m.name}(\n${fieldLines.join(",\n")}\n)\n`);
-      } else {
-        types.push(`class ${m.name}\n`);
-      }
-    }
-
+    // ---- client ----
     const client: string[] = [];
-    client.push("// Generated by @speconn/typespec-speconn. DO NOT EDIT.\n");
+    client.push("// Generated by @speconn/typespec-emitter-kotlin. DO NOT EDIT.\n");
     client.push(`package ${pkg}\n`);
-    client.push("import speconn.UnaryClient");
-    client.push("import speconn.HttpClient");
-    client.push("import io.ktor.client.HttpClient as KtorHttpClient\n");
-    client.push(`interface ${svc.serviceName}Client {`);
+    client.push("import speconn.SpeconnClient");
+    client.push("import speconn.SpeconnTransport");
+    client.push("import speconn.CallOptions");
+    client.push("import speconn.Response");
+    client.push("import speconn.StreamResponse");
+    if (allTypeNames.length > 0) {
+      client.push(`import ${pkg}.types.${allTypeNames.join(`\nimport ${pkg}.types.`)}`);
+    }
+    if (allCodecNames.length > 0) {
+      client.push(`import ${pkg}.types.${allCodecNames.join(`\nimport ${pkg}.types.`)}`);
+    }
+    client.push('');
+    client.push(`class ${svc.serviceName}Client(baseUrl: String, transport: SpeconnTransport) {`);
     for (const rpc of svc.rpcs) {
-      const reqName = rpc.inputType?.name || "Unit";
-      const resName = rpc.outputType?.name || "Unit";
+      client.push(`    private val _${rpc.name} = SpeconnClient(baseUrl, "${rpc.path}", transport)`);
+    }
+    for (const rpc of svc.rpcs) {
       if (rpc.isStream) {
-        client.push(`    suspend fun ${rpc.name}(request: ${reqName}, headers: Map<String, String> = emptyMap()): List<${resName}>`);
+        client.push(`    suspend fun ${rpc.name}(req: ${reqType(rpc)}, headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): StreamResponse<${resType(rpc)}> =`);
+        client.push(`        _${rpc.name}.stream(${reqCodec(rpc)}, req, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
       } else {
-        client.push(`    suspend fun ${rpc.name}(request: ${reqName}, headers: Map<String, String> = emptyMap()): ${resName}`);
+        client.push(`    suspend fun ${rpc.name}(req: ${reqType(rpc)}, headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): Response<${resType(rpc)}> =`);
+        client.push(`        _${rpc.name}.call(${reqCodec(rpc)}, req, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
       }
     }
     client.push('}\n');
-    client.push(`class ${svc.serviceName}ClientImpl(`);
-    client.push(`    private val unaryClient: UnaryClient`);
-    client.push(`) : ${svc.serviceName}Client {`);
-    for (const rpc of svc.rpcs) {
-      const reqName = rpc.inputType?.name || "Unit";
-      const resName = rpc.outputType?.name || "Unit";
-      if (rpc.isStream) {
-        client.push(`    override suspend fun ${rpc.name}(request: ${reqName}, headers: Map<String, String>): List<${resName}> =`);
-        client.push(`        unaryClient.stream<${reqName}, ${resName}>("${rpc.path}", request, headers)`);
-      } else {
-        client.push(`    override suspend fun ${rpc.name}(request: ${reqName}, headers: Map<String, String>): ${resName} =`);
-        client.push(`        unaryClient.call<${reqName}, ${resName}>("${rpc.path}", request, headers)`);
-      }
-    }
-    client.push('}\n');
-    client.push(`fun ${svc.serviceName}Client(httpClient: HttpClient, baseUrl: String): ${svc.serviceName}Client =`);
-    client.push(`    ${svc.serviceName}ClientImpl(UnaryClient(baseUrl, httpClient))\n`);
-    client.push(`fun ${svc.serviceName}Client(ktorClient: KtorHttpClient, baseUrl: String): ${svc.serviceName}Client =`);
-    client.push(`    ${svc.serviceName}ClientImpl(UnaryClient(baseUrl, ktorClient))\n`);
 
-    promises.push(emitFile(program, { path: `${outputDir}/${fn.types}`, content: types.join("\n") }));
-    promises.push(emitFile(program, { path: `${outputDir}/${fn.client}`, content: client.join("\n") }));
+    promises.push(emitFile(program, { path: `${outputDir}/${svc.serviceName}Client.kt`, content: client.join("\n") }));
   }
-  return Promise.all(promises);
+  await Promise.all(promises);
 }
 
-// ==================== Main Emitter ====================
-
 export async function $onEmit(context: EmitContext<EmitterOptions>) {
-  const program = context.program;
-  const outputDir = context.emitterOutputDir;
-
-  const services = collectServices(program);
-
-  await emitKotlin(program, services, outputDir);
+  const services = collectServices(context.program);
+  await emitKotlin(context.program, services, context.emitterOutputDir);
 }
