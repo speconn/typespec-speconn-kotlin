@@ -42,6 +42,8 @@ async function emitKotlin(program: Program, services: ServiceInfo[], outputDir: 
     client.push("import speconn.CallOptions");
     client.push("import speconn.Response");
     client.push("import speconn.StreamResponse");
+    client.push("import speconn.ClientStreamHandle");
+    client.push("import speconn.BidiStreamHandle");
     if (allTypeNames.length > 0) {
       client.push(`import ${pkg}.types.${allTypeNames.join(`\nimport ${pkg}.types.`)}`);
     }
@@ -54,12 +56,22 @@ async function emitKotlin(program: Program, services: ServiceInfo[], outputDir: 
       client.push(`    private val _${rpc.name} = SpeconnClient(baseUrl, "${rpc.path}", transport)`);
     }
     for (const rpc of svc.rpcs) {
-      if (rpc.isStream) {
-        client.push(`    suspend fun ${rpc.name}(req: ${reqType(rpc)}, headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): StreamResponse<${resType(rpc)}> =`);
-        client.push(`        _${rpc.name}.stream(${reqCodec(rpc)}, req, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
-      } else {
-        client.push(`    suspend fun ${rpc.name}(req: ${reqType(rpc)}, headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): Response<${resType(rpc)}> =`);
-        client.push(`        _${rpc.name}.call(${reqCodec(rpc)}, req, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
+      switch (rpc.streamType) {
+        case "server":
+          client.push(`    suspend fun ${rpc.name}(req: ${reqType(rpc)}, headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): StreamResponse<${resType(rpc)}> =`);
+          client.push(`        _${rpc.name}.stream(${reqCodec(rpc)}, req, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
+          break;
+        case "client":
+          client.push(`    fun ${rpc.name}(headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): ClientStreamHandle<${reqType(rpc)}, ${resType(rpc)}> =`);
+          client.push(`        _${rpc.name}.clientStream(${reqCodec(rpc)}, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
+          break;
+        case "bidi":
+          client.push(`    fun ${rpc.name}(headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): BidiStreamHandle<${reqType(rpc)}, ${resType(rpc)}> =`);
+          client.push(`        _${rpc.name}.bidi(${reqCodec(rpc)}, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
+          break;
+        default:
+          client.push(`    suspend fun ${rpc.name}(req: ${reqType(rpc)}, headers: Map<String, String> = emptyMap(), timeoutMs: Long? = null): Response<${resType(rpc)}> =`);
+          client.push(`        _${rpc.name}.call(${reqCodec(rpc)}, req, ${resCodec(rpc)}, CallOptions(headers, timeoutMs))`);
       }
     }
     client.push('}\n');
